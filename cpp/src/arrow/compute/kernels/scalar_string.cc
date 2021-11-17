@@ -326,8 +326,7 @@ struct StringTransformBase {
 
   // Return the maximum total size of the output in codeunits (i.e. bytes)
   // given input characteristics.
-  virtual int64_t MaxCodeunits(const uint8_t* input, int64_t ninputs,
-                               int64_t input_ncodeunits) {
+  virtual int64_t MaxCodeunits(int64_t ninputs, int64_t input_ncodeunits) {
     return input_ncodeunits;
   }
 
@@ -341,12 +340,13 @@ struct StringTransformBase {
 /// following signature:
 ///
 /// int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-///                   uint8_t* output);
+///                   arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits);
 ///
 /// where
 ///   * `input` is the input sequence (binary or string)
 ///   * `input_string_ncodeunits` is the length of input sequence in codeunits
-///   * `output` is the output sequence (binary or string)
+///   * `output_buffer` is the output buffer
+///   * `output_string_ncodeunits` is the length of output sequence in codeunits
 ///
 /// and returns the number of codeunits of the `output` sequence or a negative
 /// value if an invalid input sequence is detected.
@@ -369,10 +369,8 @@ struct StringTransformExecBase {
     ArrayType input(data);
     const int64_t input_ncodeunits = input.total_values_length();
     const int64_t input_nstrings = input.length();
-    const uint8_t* input_string = input.raw_data() + input.value_offset(0);
 
-    const int64_t max_output_ncodeunits =
-        transform->MaxCodeunits(input_string, input_nstrings, input_ncodeunits);
+    const int64_t max_output_ncodeunits = transform->MaxCodeunits(input_nstrings, input_ncodeunits);
     RETURN_NOT_OK(CheckOutputCapacity(max_output_ncodeunits));
 
     ArrayData* output = out->mutable_array();
@@ -381,7 +379,6 @@ struct StringTransformExecBase {
 
     // String offsets are preallocated
     offset_type* output_string_offsets = output->GetMutableValues<offset_type>(1);
-    uint8_t* output_str = output->buffers[2]->mutable_data();
     offset_type output_ncodeunits = 0;
     output_string_offsets[0] = output_ncodeunits;
     for (int64_t i = 0; i < input_nstrings; i++) {
@@ -389,8 +386,7 @@ struct StringTransformExecBase {
         offset_type input_string_ncodeunits;
         const uint8_t* input_string = input.GetValue(i, &input_string_ncodeunits);
         auto encoded_nbytes = static_cast<offset_type>(transform->Transform(
-            input_string, input_string_ncodeunits, output_str + output_ncodeunits,
-            max_output_ncodeunits - output_ncodeunits));
+            input_string, input_string_ncodeunits, values_buffer.get(), output_ncodeunits));
         if (encoded_nbytes < 0) {
           return transform->InvalidInputSequence();
         }
@@ -411,8 +407,7 @@ struct StringTransformExecBase {
       return Status::OK();
     }
     const int64_t data_nbytes = static_cast<int64_t>(input.value->size());
-    const int64_t max_output_ncodeunits =
-        transform->MaxCodeunits(input.value->data(), 1, data_nbytes);
+    const int64_t max_output_ncodeunits = transform->MaxCodeunits(1, data_nbytes);
     RETURN_NOT_OK(CheckOutputCapacity(max_output_ncodeunits));
 
     ARROW_ASSIGN_OR_RAISE(auto value_buffer, ctx->Allocate(max_output_ncodeunits));
@@ -421,7 +416,7 @@ struct StringTransformExecBase {
     result->value = value_buffer;
     auto encoded_nbytes = static_cast<offset_type>(
         transform->Transform(input.value->data(), data_nbytes,
-                             value_buffer->mutable_data(), max_output_ncodeunits));
+                             value_buffer.get(), max_output_ncodeunits));
     if (encoded_nbytes < 0) {
       return transform->InvalidInputSequence();
     }
@@ -485,20 +480,18 @@ struct FixedSizeBinaryTransformExecBase {
     const int64_t input_nstrings = input.length();
     ARROW_ASSIGN_OR_RAISE(auto values_buffer,
                           ctx->Allocate(output_width * input_nstrings));
-    uint8_t* output_str = values_buffer->mutable_data();
 
+    size_t output_ncodeunits = 0;
     for (int64_t i = 0; i < input_nstrings; i++) {
       if (!input.IsNull(i)) {
         const uint8_t* input_string = input.GetValue(i);
         auto encoded_nbytes = static_cast<int32_t>(
-            transform->Transform(input_string, input_width, output_str, output_width));
+            transform->Transform(input_string, input_width, values_buffer.get(), output_ncodeunits));
         if (encoded_nbytes != output_width) {
           return transform->InvalidInputSequence();
         }
-      } else {
-        std::memset(output_str, 0x00, output_width);
       }
-      output_str += output_width;
+      output_ncodeunits += output_width;
     }
 
     output->buffers[1] = std::move(values_buffer);
@@ -518,7 +511,7 @@ struct FixedSizeBinaryTransformExecBase {
     const int32_t data_nbytes = static_cast<int32_t>(input.value->size());
     ARROW_ASSIGN_OR_RAISE(auto value_buffer, ctx->Allocate(out_width));
     auto encoded_nbytes = static_cast<int32_t>(transform->Transform(
-        input.value->data(), data_nbytes, value_buffer->mutable_data(), out_width));
+        input.value->data(), data_nbytes, value_buffer.get(), out_width));
     if (encoded_nbytes != out_width) {
       return transform->InvalidInputSequence();
     }
@@ -916,8 +909,7 @@ struct FunctionalCaseMappingTransform : public StringTransformBase {
     return Status::OK();
   }
 
-  int64_t MaxCodeunits(const uint8_t* input, int64_t ninputs,
-                       int64_t input_ncodeunits) override {
+  int64_t MaxCodeunits(int64_t ninputs, int64_t input_ncodeunits) override {
     // Section 5.18 of the Unicode spec claims that the number of codepoints for case
     // mapping can grow by a factor of 3. This means grow by a factor of 3 in bytes
     // However, since we don't support all casings (SpecialCasing.txt) the growth
@@ -931,7 +923,8 @@ struct FunctionalCaseMappingTransform : public StringTransformBase {
 template <typename CodepointTransform>
 struct StringTransformCodepoint : public FunctionalCaseMappingTransform {
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     uint8_t* output_start = output;
     if (ARROW_PREDICT_FALSE(
             !arrow::util::UTF8Transform(input, input + input_string_ncodeunits, &output,
@@ -984,7 +977,8 @@ using UTF8SwapCase =
 
 struct Utf8CapitalizeTransform : public FunctionalCaseMappingTransform {
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     uint8_t* output_start = output;
     const uint8_t* end = input + input_string_ncodeunits;
     const uint8_t* next = input;
@@ -1010,7 +1004,8 @@ using Utf8Capitalize = StringTransformExec<Type, Utf8CapitalizeTransform>;
 
 struct Utf8TitleTransform : public FunctionalCaseMappingTransform {
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     uint8_t* output_start = output;
     const uint8_t* end = input + input_string_ncodeunits;
     const uint8_t* next = input;
@@ -1052,27 +1047,36 @@ struct Utf8NormalizeTransform : public FunctionalCaseMappingTransform {
   explicit Utf8NormalizeTransform(const Utf8NormalizeOptions& options)
       : options_(options) {}
 
-  int64_t MaxCodeunits(const uint8_t* input, int64_t ninputs,
-                       int64_t input_ncodeunits) override {
-    const auto option = GenerateUtf8NormalizeOption(options_.form);
-    const auto n_chars = utf8proc_decompose(input, input_ncodeunits, NULL, 0, option);
-
-    // convert to byte length
-    return n_chars * 4;
+  int64_t MaxCodeunits(int64_t ninputs, int64_t input_ncodeunits) override {
+    // heuristic で決めました
+    return input_ncodeunits * 4;
   }
 
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     uint8_t* output_start = output;
 
     const auto option = GenerateUtf8NormalizeOption(options_.form);
-    const auto n_chars = utf8proc_decompose(input, input_string_ncodeunits,
+    auto output_length = output_buffer->size() - output_string_ncodeunits;
+    const auto n_writen_chars = utf8proc_decompose(input, input_string_ncodeunits,
                                             reinterpret_cast<utf8proc_int32_t*>(output),
-                                            output_string_ncodeunits, option);
-    if (n_chars < 0) return output_string_ncodeunits;
+                                            output_length, option);
+
+    if (n_writen_chars > output_length) {
+      const auto needs = n_writen_chars + output_length;
+      // 多めに取得
+      const auto status = output_buffer->Resize(needs * 4);
+      if (status != arrow::Status::OK()) return output_string_ncodeunits;
+
+      const auto n_writen_chars = utf8proc_decompose(input, input_string_ncodeunits,
+                                        reinterpret_cast<utf8proc_int32_t*>(output),
+                                        output_length, option);
+      if (n_writen_chars < 0) return output_string_ncodeunits;
+    }
 
     const auto n_codepoints = utf8proc_normalize_utf32(
-        reinterpret_cast<utf8proc_int32_t*>(output), n_chars, option);
+        reinterpret_cast<utf8proc_int32_t*>(output), n_writen_chars, option);
     if (n_codepoints < 0) return output_string_ncodeunits;
 
     auto codepoints = reinterpret_cast<utf8proc_int32_t*>(output);
@@ -1110,7 +1114,8 @@ using Utf8Normalize = StringTransformExecWithState<Type, Utf8NormalizeTransform>
 
 struct AsciiReverseTransform : public StringTransformBase {
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     uint8_t utf8_char_found = 0;
     for (int64_t i = 0; i < input_string_ncodeunits; i++) {
       // if a utf8 char is found, report to utf8_char_found
@@ -1130,7 +1135,8 @@ using AsciiReverse = StringTransformExec<Type, AsciiReverseTransform>;
 
 struct Utf8ReverseTransform : public StringTransformBase {
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     int64_t i = 0;
     while (i < input_string_ncodeunits) {
       int64_t char_end = std::min(i + util::ValidUtf8CodepointByteSize(input + i),
@@ -1244,7 +1250,8 @@ struct AsciiSwapCase {
 
 struct AsciiCapitalizeTransform : public StringTransformBase {
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     if (input_string_ncodeunits > 0) {
       *output++ = ascii_toupper(*input++);
       TransformAsciiLower(input, input_string_ncodeunits - 1, output);
@@ -1258,7 +1265,8 @@ using AsciiCapitalize = StringTransformExec<Type, AsciiCapitalizeTransform>;
 
 struct AsciiTitleTransform : public StringTransformBase {
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     const uint8_t* end = input + input_string_ncodeunits;
     const uint8_t* next = input;
     bool is_next_upper = true;
@@ -2038,8 +2046,7 @@ struct SliceTransformBase : public StringTransformBase {
 };
 
 struct SliceCodeunitsTransform : SliceTransformBase {
-  int64_t MaxCodeunits(const uint8_t* input, int64_t ninputs,
-                       int64_t input_ncodeunits) override {
+  int64_t MaxCodeunits(int64_t ninputs, int64_t input_ncodeunits) override {
     const SliceOptions& opt = *this->options;
     if ((opt.start >= 0) != (opt.stop >= 0)) {
       // If start and stop don't have the same sign, we can't guess an upper bound
@@ -2053,7 +2060,8 @@ struct SliceCodeunitsTransform : SliceTransformBase {
   }
 
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     if (options->step >= 1) {
       return SliceForward(input, input_string_ncodeunits, output);
     }
@@ -3297,8 +3305,7 @@ struct ReplaceSliceTransformBase : public StringTransformBase {
   explicit ReplaceSliceTransformBase(const ReplaceSliceOptions& options)
       : options{&options} {}
 
-  int64_t MaxCodeunits(const uint8_t* input, int64_t ninputs,
-                       int64_t input_ncodeunits) override {
+  int64_t MaxCodeunits(int64_t ninputs, int64_t input_ncodeunits) override {
     return ninputs * options->replacement.size() + input_ncodeunits;
   }
 };
@@ -3306,7 +3313,8 @@ struct ReplaceSliceTransformBase : public StringTransformBase {
 struct BinaryReplaceSliceTransform : ReplaceSliceTransformBase {
   using ReplaceSliceTransformBase::ReplaceSliceTransformBase;
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     const auto& opts = *options;
     int64_t before_slice = 0;
     int64_t after_slice = 0;
@@ -3361,7 +3369,8 @@ struct BinaryReplaceSliceTransform : ReplaceSliceTransformBase {
 struct Utf8ReplaceSliceTransform : ReplaceSliceTransformBase {
   using ReplaceSliceTransformBase::ReplaceSliceTransformBase;
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     const auto& opts = *options;
     const uint8_t* begin = input;
     const uint8_t* end = input + input_string_ncodeunits;
@@ -3721,8 +3730,7 @@ struct AsciiPadTransform : public StringTransformBase {
     return Status::OK();
   }
 
-  int64_t MaxCodeunits(const uint8_t* input, int64_t ninputs,
-                       int64_t input_ncodeunits) override {
+  int64_t MaxCodeunits(int64_t ninputs, int64_t input_ncodeunits) override {
     // This is likely very overallocated but hard to do better without
     // actually looking at each string (because of strings that may be
     // longer than the given width)
@@ -3730,7 +3738,8 @@ struct AsciiPadTransform : public StringTransformBase {
   }
 
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     if (input_string_ncodeunits >= options_.width) {
       std::copy(input, input + input_string_ncodeunits, output);
       return input_string_ncodeunits;
@@ -3776,8 +3785,7 @@ struct Utf8PadTransform : public StringTransformBase {
     return Status::OK();
   }
 
-  int64_t MaxCodeunits(const uint8_t* input, int64_t ninputs,
-                       int64_t input_ncodeunits) override {
+  int64_t MaxCodeunits(int64_t ninputs, int64_t input_ncodeunits) override {
     // This is likely very overallocated but hard to do better without
     // actually looking at each string (because of strings that may be
     // longer than the given width)
@@ -3786,7 +3794,8 @@ struct Utf8PadTransform : public StringTransformBase {
   }
 
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     const int64_t input_width = util::UTF8Length(input, input + input_string_ncodeunits);
     if (input_width >= options_.width) {
       std::copy(input, input + input_string_ncodeunits, output);
@@ -3847,7 +3856,8 @@ struct UTF8TrimWhitespaceTransform : public StringTransformBase {
   }
 
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     const uint8_t* begin = input;
     const uint8_t* end = input + input_string_ncodeunits;
     const uint8_t* end_trimmed = end;
@@ -3912,7 +3922,8 @@ struct UTF8TrimTransform : public StringTransformBase {
   }
 
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     const uint8_t* begin = input;
     const uint8_t* end = input + input_string_ncodeunits;
     const uint8_t* end_trimmed = end;
@@ -3949,7 +3960,8 @@ using UTF8RTrim = StringTransformExecWithState<Type, UTF8TrimTransform<false, tr
 template <bool TrimLeft, bool TrimRight>
 struct AsciiTrimWhitespaceTransform : public StringTransformBase {
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     const uint8_t* begin = input;
     const uint8_t* end = input + input_string_ncodeunits;
     const uint8_t* end_trimmed = end;
@@ -4002,7 +4014,8 @@ struct AsciiTrimTransform : public StringTransformBase {
   explicit AsciiTrimTransform(const AsciiTrimState& state) : state_(state) {}
 
   int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
-                    uint8_t* output, int64_t output_string_ncodeunits) {
+                    arrow::ResizableBuffer* output_buffer, int64_t output_string_ncodeunits) {
+    uint8_t* output = output_buffer->mutable_data() + output_string_ncodeunits;
     const uint8_t* begin = input;
     const uint8_t* end = input + input_string_ncodeunits;
     const uint8_t* end_trimmed = end;
